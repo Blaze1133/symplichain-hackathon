@@ -1,0 +1,217 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ap-south-1
+  EC2_PROD_HOST: ${{ secrets.PROD_EC2_HOST }}
+  EC2_USER: ubuntu
+  S3_BUCKET: ${{ secrets.PROD_S3_BUCKET }}
+  CLOUDFRONT_DIST_ID: ${{ secrets.PROD_CLOUDFRONT_ID }}
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: symflow
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: symflow_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Django tests
+        env:
+          DATABASE_URL: postgres://symflow:testpass@localhost:5432/symflow_test
+          REDIS_URL: redis://localhost:6379/0
+          DJANGO_SETTINGS_MODULE: symflow.settings.test
+        run: |
+          python manage.py test --verbosity=2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run frontend tests
+        working-directory: frontend
+        run: npm test -- --watchAll=false
+
+  deploy-backend:
+    name: Deploy Backend to Production EC2
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/prod_key
+          chmod 600 ~/.ssh/prod_key
+          ssh-keyscan -H ${{ env.EC2_PROD_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create deployment backup
+        run: |
+          ssh -i ~/.ssh/prod_key ${{ env.EC2_USER }}@${{ env.EC2_PROD_HOST }} << 'BACKUP_SCRIPT'
+            cd /home/ubuntu/symflow
+            # Store current commit hash for rollback
+            git rev-parse HEAD > /home/ubuntu/last_good_commit.txt
+            echo "Backup commit: $(cat /home/ubuntu/last_good_commit.txt)"
+          BACKUP_SCRIPT
+
+      - name: Deploy backend to EC2
+        run: |
+          ssh -i ~/.ssh/prod_key ${{ env.EC2_USER }}@${{ env.EC2_PROD_HOST }} << 'DEPLOY_SCRIPT'
+            cd /home/ubuntu/symflow
+
+            git fetch origin main
+            git checkout main
+            git pull origin main
+
+            source venv/bin/activate
+            pip install -r requirements.txt
+
+            python manage.py migrate --noinput
+            python manage.py collectstatic --noinput
+
+            # Graceful restart so active requests finish
+            sudo systemctl reload gunicorn
+
+            sudo systemctl restart celery-worker
+            sudo systemctl restart celery-beat
+
+            echo "Production backend deployment complete"
+          DEPLOY_SCRIPT
+
+      - name: Verify deployment health
+        run: |
+          sleep 15
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://${{ env.EC2_PROD_HOST }}/api/health/)
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed with status $STATUS, triggering rollback..."
+            ssh -i ~/.ssh/prod_key ${{ env.EC2_USER }}@${{ env.EC2_PROD_HOST }} << 'ROLLBACK'
+              cd /home/ubuntu/symflow
+              LAST_COMMIT=$(cat /home/ubuntu/last_good_commit.txt)
+              git checkout $LAST_COMMIT
+              source venv/bin/activate
+              pip install -r requirements.txt
+              sudo systemctl reload gunicorn
+              sudo systemctl restart celery-worker
+              echo "Rolled back to $LAST_COMMIT"
+            ROLLBACK
+            exit 1
+          fi
+          echo "Production backend is healthy"
+
+  deploy-frontend:
+    name: Deploy Frontend to Production S3
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          REACT_APP_API_URL: ${{ secrets.PROD_API_URL }}
+        run: npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sync build to S3
+        run: |
+          aws s3 sync frontend/build/ s3://${{ env.S3_BUCKET }} \
+            --delete \
+            --cache-control "public, max-age=31536000" \
+            --exclude "index.html"
+
+          aws s3 cp frontend/build/index.html s3://${{ env.S3_BUCKET }}/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ env.CLOUDFRONT_DIST_ID }} \
+            --paths "/*"
+
+      - name: Notify on Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "PRODUCTION deploy ${{ job.status }}: ${{ github.event.head_commit.message }} by ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
